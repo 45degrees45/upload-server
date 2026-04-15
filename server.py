@@ -2,6 +2,7 @@
 """Screenshot upload server — stdlib only, port 8400."""
 
 import json
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
@@ -49,7 +50,8 @@ const zone=document.getElementById('zone'),
 function loadFiles(){
   fetch('/files').then(r=>r.json()).then(data=>{
     const ul=document.getElementById('files');
-    ul.innerHTML=data.length?data.map(f=>`<li>${f}</li>`).join(''):'<li><em>No files yet</em></li>';
+    function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+    ul.innerHTML=data.length?data.map(f=>`<li>${esc(f)}</li>`).join(''):'<li><em>No files yet</em></li>';
   });
 }
 
@@ -86,21 +88,39 @@ loadFiles();
 
 
 def _parse_multipart(content_type: str, body: bytes):
-    """Return (filename, data) from a multipart/form-data body, or (None, None)."""
-    boundary = content_type.split("boundary=")[1].strip().encode()
-    for part in body.split(b"--" + boundary):
+    """Return (filename, data) from a multipart/form-data body, or (None, None).
+    Uses memoryview to avoid copying payload bytes."""
+    m = re.search(r'boundary="?([^";]+)"?', content_type)
+    if not m:
+        return None, None
+    boundary = m.group(1).strip().encode()
+    mv = memoryview(body)
+    sep = b"--" + boundary
+    start = body.find(sep)
+    while start != -1:
+        part_start = start + len(sep)
+        # Skip \r\n after boundary
+        if body[part_start:part_start+2] == b"\r\n":
+            part_start += 2
+        next_sep = body.find(b"\r\n--" + boundary, part_start)
+        if next_sep == -1:
+            break
+        part = body[part_start:next_sep]
         if b"\r\n\r\n" not in part:
+            start = body.find(sep, next_sep)
             continue
-        head, payload = part.split(b"\r\n\r\n", 1)
-        payload = payload.rstrip(b"\r\n")
-        head_str = head.decode("utf-8", errors="replace")
-        if "filename=" not in head_str:
-            continue
-        for line in head_str.splitlines():
-            if "filename=" in line:
-                raw = line.split("filename=")[1].strip().strip('"')
-                filename = Path(raw).name  # strip path traversal
-                return filename, payload
+        head_end = part.find(b"\r\n\r\n")
+        head_str = part[:head_end].decode("utf-8", errors="replace")
+        if "filename=" in head_str:
+            for line in head_str.splitlines():
+                if "filename=" in line:
+                    raw = line.split("filename=")[1].strip().strip('"')
+                    filename = Path(raw).name
+                    # Use memoryview slice — no copy of payload bytes
+                    payload_start = part_start + head_end + 4
+                    payload_end = next_sep
+                    return filename, bytes(mv[payload_start:payload_end])
+        start = body.find(sep, next_sep)
     return None, None
 
 
@@ -116,7 +136,11 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML)
         elif self.path == "/files":
-            files = sorted(f.name for f in UPLOAD_DIR.iterdir() if f.is_file())
+            try:
+                files = sorted(f.name for f in UPLOAD_DIR.iterdir() if f.is_file())
+            except FileNotFoundError:
+                UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+                files = []
             body = json.dumps(files).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
